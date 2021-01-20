@@ -10,14 +10,14 @@ namespace yii\elasticsearch;
 use Yii;
 use yii\base\Component;
 use yii\base\InvalidConfigException;
-use yii\base\InvalidParamException;
+use yii\base\InvalidArgumentException;
 use yii\helpers\Json;
 
 /**
- * elasticsearch Connection is used to connect to an elasticsearch cluster version 0.20 or higher
+ * Elasticsearch Connection is used to connect to an Elasticsearch cluster version 0.20 or higher
  *
  * @property string $driverName Name of the DB driver. This property is read-only.
- * @property boolean $isActive Whether the DB connection is established. This property is read-only.
+ * @property bool $isActive Whether the DB connection is established. This property is read-only.
  * @property QueryBuilder $queryBuilder This property is read-only.
  *
  * @author Carsten Brandt <mail@cebe.cc>
@@ -35,7 +35,7 @@ class Connection extends Component
      */
     public $autodetectCluster = true;
     /**
-     * @var array The elasticsearch cluster nodes to connect to.
+     * @var array The Elasticsearch cluster nodes to connect to.
      *
      * This is populated with the result of a cluster nodes request when [[autodetectCluster]] is true.
      *
@@ -53,7 +53,7 @@ class Connection extends Component
      *
      *  - `protocol`: explicitly sets the protocol for the current node (useful when manually defining a HTTPS cluster)
      *
-     * @see http://www.elastic.co/guide/en/elasticsearch/reference/current/cluster-nodes-info.html#cluster-nodes-info
+     * @see https://www.elastic.co/guide/en/elasticsearch/reference/current/cluster-nodes-info.html#cluster-nodes-info
      */
     public $nodes = [
         ['http_address' => 'inet[/127.0.0.1:9200]'],
@@ -63,7 +63,7 @@ class Connection extends Component
      */
     public $activeNode;
     /**
-     * @var array Authentication data used to connect to the ElasticSearch node.
+     * @var array Authentication data used to connect to the Elasticsearch node.
      *
      * Array elements:
      *
@@ -84,17 +84,23 @@ class Connection extends Component
      */
     public $defaultProtocol = 'http';
     /**
-     * @var float timeout to use for connecting to an elasticsearch node.
+     * @var float timeout to use for connecting to an Elasticsearch node.
      * This value will be used to configure the curl `CURLOPT_CONNECTTIMEOUT` option.
      * If not set, no explicit timeout will be set for curl.
      */
     public $connectionTimeout = null;
     /**
-     * @var float timeout to use when reading the response from an elasticsearch node.
+     * @var float timeout to use when reading the response from an Elasticsearch node.
      * This value will be used to configure the curl `CURLOPT_TIMEOUT` option.
      * If not set, no explicit timeout will be set for curl.
      */
     public $dataTimeout = null;
+    /**
+     * @var integer version of the domain-specific language to use with the server.
+     * This must be set to the major version of the Elasticsearch server in use, e.g. `5` for Elasticsearch 5.x.x,
+     * `6` for Elasticsearch 6.x.x, and `7` for Elasticsearch 7.x.x.
+     */
+    public $dslVersion = 5;
 
     /**
      * @var resource the curl instance returned by [curl_init()](http://php.net/manual/en/function.curl-init.php).
@@ -130,7 +136,7 @@ class Connection extends Component
 
     /**
      * Returns a value indicating whether the DB connection is established.
-     * @return boolean whether the DB connection is established
+     * @return bool whether the DB connection is established
      */
     public function getIsActive()
     {
@@ -148,14 +154,14 @@ class Connection extends Component
             return;
         }
         if (empty($this->nodes)) {
-            throw new InvalidConfigException('elasticsearch needs at least one node to operate.');
+            throw new InvalidConfigException('Elasticsearch needs at least one node to operate.');
         }
         $this->_curl = curl_init();
         if ($this->autodetectCluster) {
             $this->populateNodes();
         }
         $this->selectActiveNode();
-        Yii::trace('Opening connection to elasticsearch. Nodes in cluster: ' . count($this->nodes)
+        Yii::trace('Opening connection to Elasticsearch. Nodes in cluster: ' . count($this->nodes)
             . ', active node: ' . $this->nodes[$this->activeNode]['http_address'], __CLASS__);
         $this->initConnection();
     }
@@ -189,7 +195,7 @@ class Connection extends Component
             }
             $node['http_address'] = $node['http']['publish_address'];
 
-            //Protocol is not a standard ES node property, so we add it manually
+            // Protocol is not a standard ES node property, so we add it manually
             $node['protocol'] = $this->defaultProtocol;
         }
 
@@ -197,7 +203,7 @@ class Connection extends Component
             $this->nodes = array_values($nodes);
         } else {
             curl_close($this->_curl);
-            throw new Exception('Cluster autodetection did not find any active nodes.');
+            throw new Exception('Cluster autodetection did not find any active node. Make sure a GET /_nodes reguest on the hosts defined in the config returns the "http_address" field for each node.');
         }
     }
 
@@ -219,7 +225,7 @@ class Connection extends Component
         if ($this->activeNode === null) {
             return;
         }
-        Yii::trace('Closing connection to elasticsearch. Active node was: '
+        Yii::trace('Closing connection to Elasticsearch. Active node was: '
             . $this->nodes[$this->activeNode]['http']['publish_address'], __CLASS__);
         $this->activeNode = null;
         if ($this->_curl) {
@@ -291,7 +297,7 @@ class Connection extends Component
      * @param string|array $url URL
      * @param array $options URL options
      * @param string $body request body
-     * @param boolean $raw if response body contains JSON and should be decoded
+     * @param bool $raw if response body contains JSON and should be decoded
      * @return mixed response
      * @throws Exception
      * @throws InvalidConfigException
@@ -324,7 +330,7 @@ class Connection extends Component
      * @param string|array $url URL
      * @param array $options URL options
      * @param string $body request body
-     * @param boolean $raw if response body contains JSON and should be decoded
+     * @param bool $raw if response body contains JSON and should be decoded
      * @return mixed response
      * @throws Exception
      * @throws InvalidConfigException
@@ -334,44 +340,6 @@ class Connection extends Component
         $this->open();
         return $this->httpRequest('POST', $this->createUrl($url, $options), $body, $raw);
     }
-    
-    
-     public function postInsert($url, $options = [], $body = null, $raw = false)
-    {
-        $this->open();
-        return $this->httpRequest('POST', $this->createUrlInsert($url, $options), $body, $raw);
-    }
-    /**
-     * Creates URL
-     *
-     * @param string|array $path path
-     * @param array $options URL options
-     * @return array
-     */
-    private function createUrlInsert($path, $options = [])
-    {
-        if (!is_string($path)) {
-            $url = implode('/', array_map(function ($a) {
-                return urlencode(is_array($a) ? implode(',', $a) : $a);
-            }, $path));
-            $es_pro_id = Yii::$app->params['es_pro_id'];
-            $url .= '/'.$es_pro_id.'?op_type=create';
-            //if (!empty($options)) {
-            //    $url .= '?' . http_build_query($options);
-           // }
-        } else {
-            $url = $path;
-            if (!empty($options)) {
-                $url .= (strpos($url, '?') === false ? '?' : '&') . http_build_query($options);
-            }
-        }
-
-        $node = $this->nodes[$this->activeNode];
-        $protocol = isset($node['protocol']) ? $node['protocol'] : $this->defaultProtocol;
-        $host = $node['http_address'];
-
-        return [$protocol, $host, $url];
-    }
 
     /**
      * Performs PUT HTTP request
@@ -379,7 +347,7 @@ class Connection extends Component
      * @param string|array $url URL
      * @param array $options URL options
      * @param string $body request body
-     * @param boolean $raw if response body contains JSON and should be decoded
+     * @param bool $raw if response body contains JSON and should be decoded
      * @return mixed response
      * @throws Exception
      * @throws InvalidConfigException
@@ -396,7 +364,7 @@ class Connection extends Component
      * @param string|array $url URL
      * @param array $options URL options
      * @param string $body request body
-     * @param boolean $raw if response body contains JSON and should be decoded
+     * @param bool $raw if response body contains JSON and should be decoded
      * @return mixed response
      * @throws Exception
      * @throws InvalidConfigException
@@ -443,7 +411,7 @@ class Connection extends Component
      * @param string $method method name
      * @param string $url URL
      * @param string $requestBody request body
-     * @param boolean $raw if response body contains JSON and should be decoded
+     * @param bool $raw if response body contains JSON and should be decoded
      * @return mixed if request failed
      * @throws Exception if request failed
      * @throws InvalidConfigException
@@ -529,7 +497,7 @@ class Connection extends Component
             $profile = false;
         }
 
-        Yii::trace("Sending request to elasticsearch node: $method $url\n$requestBody", __METHOD__);
+        Yii::trace("Sending request to Elasticsearch node: $method $url\n$requestBody", __METHOD__);
         if ($profile !== false) {
             Yii::beginProfile($profile, __METHOD__);
         }
@@ -558,7 +526,7 @@ class Connection extends Component
                 return true;
             } else {
                 if (isset($headers['content-length']) && ($len = mb_strlen($body, '8bit')) < $headers['content-length']) {
-                    throw new Exception("Incomplete data received from elasticsearch: $len < {$headers['content-length']}", [
+                    throw new Exception("Incomplete data received from Elasticsearch: $len < {$headers['content-length']}", [
                         'requestMethod' => $method,
                         'requestUrl' => $url,
                         'requestBody' => $requestBody,
@@ -567,10 +535,15 @@ class Connection extends Component
                         'responseBody' => $body,
                     ]);
                 }
-                if (isset($headers['content-type']) && (!strncmp($headers['content-type'], 'application/json', 16) || !strncmp($headers['content-type'], 'text/plain', 10))) {
-                    return $raw ? $body : Json::decode($body);
+                if (isset($headers['content-type'])) {
+                    if (!strncmp($headers['content-type'], 'application/json', 16)) {
+                        return $raw ? $body : Json::decode($body);
+                    }
+                    if (!strncmp($headers['content-type'], 'text/plain', 10)) {
+                        return $raw ? $body : array_filter(explode("\n", $body));
+                    }
                 }
-                throw new Exception('Unsupported data received from elasticsearch: ' . $headers['content-type'], [
+                throw new Exception('Unsupported data received from Elasticsearch: ' . $headers['content-type'], [
                     'requestMethod' => $method,
                     'requestUrl' => $url,
                     'requestBody' => $requestBody,
@@ -622,7 +595,7 @@ class Connection extends Component
                 $decoded['error'] = preg_replace('/\b\w+?Exception\[/', "<span style=\"color: red;\">\\0</span>\n               ", $decoded['error']);
             }
             return $decoded;
-        } catch(InvalidParamException $e) {
+        } catch(InvalidArgumentException $e) {
             return $body;
         }
     }

@@ -8,27 +8,27 @@
 namespace yii\elasticsearch;
 
 use Yii;
+use yii\base\InvalidArgumentException;
 use yii\base\InvalidCallException;
 use yii\base\InvalidConfigException;
-use yii\base\InvalidParamException;
 use yii\base\NotSupportedException;
+use yii\db\ActiveQueryInterface;
+use yii\db\ActiveRecordInterface;
 use yii\db\BaseActiveRecord;
 use yii\db\StaleObjectException;
 use yii\helpers\ArrayHelper;
 use yii\helpers\Inflector;
-use yii\helpers\Json;
 use yii\helpers\StringHelper;
 
 /**
  * ActiveRecord is the base class for classes representing relational data in terms of objects.
  *
  * This class implements the ActiveRecord pattern for the fulltext search and data storage
- * [elasticsearch](https://www.elastic.co/products/elasticsearch).
+ * [Elasticsearch](https://www.elastic.co/products/elasticsearch).
  *
- * For defining a record a subclass should at least implement the [[attributes()]] method to define
- * attributes.
- * The primary key (the `_id` field in elasticsearch terms) is represented by `getId()` and `setId()`.
- * The primary key is not part of the attributes.
+ * For defining a record a subclass should at least implement the [[attributes()]] method
+ * to define attributes.
+ * IMPORTANT: The primary key (the `_id` attribute) MUST NOT be included in [[attributes()]].
  *
  * The following is an example model called `Customer`:
  *
@@ -37,17 +37,23 @@ use yii\helpers\StringHelper;
  * {
  *     public function attributes()
  *     {
- *         return ['id', 'name', 'address', 'registration_date'];
+ *         return ['name', 'address', 'registration_date'];
  *     }
  * }
  * ```
  *
  * You may override [[index()]] and [[type()]] to define the index and type this record represents.
+ * Types are being deprecated, and it is recommended to have a single type per index. For more information
+ * read about [removal of mapping types](https://www.elastic.co/guide/en/elasticsearch/reference/current/removal-of-types.html).
+ * For Elasticsearch 7 and later (as configured in [[Connection]], [[type()]] is ignored.
  *
- * @property array|null $highlight A list of arrays with highlighted excerpts indexed by field names. This
- * property is read-only.
- * @property float $score Returns the score of this record when it was retrieved via a [[find()]] query. This
- * property is read-only.
+ * @property mixed $_id The primary key of the record. Can only be written to for new records, otherwise read-only.
+ * @property array|null $highlight A list of arrays with highlighted excerpts indexed by field names.
+ * This property is read-only.
+ * @property float $score Returns the score of this record when it was retrieved via a [[find()]] query.
+ * This property is read-only.
+ * @property array|null $explanation An explanation for each hit on how its score was computed.
+ * This property is read-only.
  *
  * @author Carsten Brandt <mail@cebe.cc>
  * @since 2.0
@@ -59,6 +65,7 @@ class ActiveRecord extends BaseActiveRecord
     private $_version;
     private $_highlight;
     private $_explanation;
+
 
     /**
      * Returns the database connection used by this AR class.
@@ -85,12 +92,16 @@ class ActiveRecord extends BaseActiveRecord
      */
     public static function findOne($condition)
     {
-        $query = static::find();
-        if (is_array($condition)) {
-            return $query->andWhere($condition)->one();
-        } else {
+        if (!is_array($condition)) {
             return static::get($condition);
         }
+        if (!ArrayHelper::isAssociative($condition)) {
+            $records = static::mget(array_values($condition));
+            return empty($records) ? null : reset($records);
+        }
+
+        $condition = static::filterCondition($condition);
+        return static::find()->andWhere($condition)->one();
     }
 
     /**
@@ -98,21 +109,40 @@ class ActiveRecord extends BaseActiveRecord
      */
     public static function findAll($condition)
     {
-        $query = static::find();
-        if (ArrayHelper::isAssociative($condition)) {
-            return $query->andWhere($condition)->all();
-        } else {
-            return static::mget((array) $condition);
+        if (!ArrayHelper::isAssociative($condition)) {
+            return static::mget(is_array($condition) ? array_values($condition) : [$condition]);
         }
+
+        $condition = static::filterCondition($condition);
+        return static::find()->andWhere($condition)->all();
+    }
+
+    /**
+     * Filter out condition parts that are array valued, to prevent building arbitrary conditions.
+     * @param array $condition
+     */
+    private static function filterCondition($condition)
+    {
+        foreach ($condition as $k => $v) {
+            if (is_array($v)) {
+                $condition[$k] = array_values($v);
+                foreach ($v as $vv) {
+                    if (is_array($vv)) {
+                        throw new InvalidArgumentException('Nested arrays are not allowed in condition for findAll() and findOne().');
+                    }
+                }
+            }
+        }
+        return $condition;
     }
 
     /**
      * Gets a record by its primary key.
      *
      * @param mixed $primaryKey the primaryKey value
-     * @param array $options options given in this parameter are passed to elasticsearch
+     * @param array $options options given in this parameter are passed to Elasticsearch
      * as request URI parameters.
-     * Please refer to the [elasticsearch documentation](http://www.elastic.co/guide/en/elasticsearch/reference/current/docs-get.html)
+     * Please refer to the [Elasticsearch documentation](https://www.elastic.co/guide/en/elasticsearch/reference/current/docs-get.html)
      * for more details on these options.
      * @return static|null The record instance or null if it was not found.
      */
@@ -123,7 +153,7 @@ class ActiveRecord extends BaseActiveRecord
         }
         $command = static::getDb()->createCommand();
         $result = $command->get(static::index(), static::type(), $primaryKey, $options);
-        if ($result['found']) {
+        if ($result && $result['found']) {
             $model = static::instantiate($result);
             static::populateRecord($model, $result);
             $model->afterFind();
@@ -138,10 +168,10 @@ class ActiveRecord extends BaseActiveRecord
      * Gets a list of records by its primary keys.
      *
      * @param array $primaryKeys an array of primaryKey values
-     * @param array $options options given in this parameter are passed to elasticsearch
+     * @param array $options options given in this parameter are passed to Elasticsearch
      * as request URI parameters.
      *
-     * Please refer to the [elasticsearch documentation](http://www.elastic.co/guide/en/elasticsearch/reference/current/docs-get.html)
+     * Please refer to the [Elasticsearch documentation](https://www.elastic.co/guide/en/elasticsearch/reference/current/docs-get.html)
      * for more details on these options.
      * @return array The record instances, or empty array if nothing was found
      */
@@ -170,9 +200,9 @@ class ActiveRecord extends BaseActiveRecord
         return $models;
     }
 
-    // TODO add more like this feature http://www.elastic.co/guide/en/elasticsearch/reference/current/search-more-like-this.html
+    // TODO add more like this feature https://www.elastic.co/guide/en/elasticsearch/reference/current/search-more-like-this.html
 
-    // TODO add percolate functionality http://www.elastic.co/guide/en/elasticsearch/reference/current/search-percolate.html
+    // TODO add percolate functionality https://www.elastic.co/guide/en/elasticsearch/reference/current/search-percolate.html
 
     // TODO implement copy and move as pk change is not possible
 
@@ -202,22 +232,10 @@ class ActiveRecord extends BaseActiveRecord
     }
 
     /**
-     * Sets the primary key
-     * @param mixed $value
-     * @throws \yii\base\InvalidCallException when record is not new
-     */
-    public function setPrimaryKey($value)
-    {
-        $pk = static::primaryKey()[0];
-        if ($this->getIsNewRecord() || $pk != '_id') {
-            $this->$pk = $value;
-        } else {
-            throw new InvalidCallException('Changing the primaryKey of an already saved record is not allowed.');
-        }
-    }
-
-    /**
-     * @inheritdoc
+     * Alias to [[get_id()]]. Returns the primary key value.
+     * @param bool $asArray
+     * @return mixed
+     * @deprecated since 2.1.0
      */
     public function getPrimaryKey($asArray = false)
     {
@@ -230,6 +248,43 @@ class ActiveRecord extends BaseActiveRecord
     }
 
     /**
+     * Alias to [[set_id()]]. Sets the primary key value.
+     * @param mixed $value
+     * @throws \yii\base\InvalidCallException when record is not new
+     * @deprecated since 2.1.0
+     */
+    public function setPrimaryKey($value)
+    {
+        $pk = static::primaryKey()[0];
+        $this->$pk = $value;
+    }
+
+    /**
+     * Sets the `_id` attribute that holds the primary key (for compatibility with relations)
+     * @param mixed $value
+     * @throws \yii\base\InvalidCallException when record is not new
+     */
+    public function set_id($value)
+    {
+        $pk = static::primaryKey()[0];
+        if ($this->getIsNewRecord()) {
+            $this->$pk = $value;
+        } else {
+            throw new InvalidCallException('Changing the primaryKey of an already saved record is not allowed.');
+        }
+    }
+
+    /**
+     * Returns the `_id` attribute that holds the primary key (for compatibility with relations)
+     * @return mixed
+     */
+    public function get_id()
+    {
+        $pk = static::primaryKey()[0];
+        return $this->$pk;
+    }
+
+    /**
      * @inheritdoc
      */
     public function getOldPrimaryKey($asArray = false)
@@ -237,10 +292,8 @@ class ActiveRecord extends BaseActiveRecord
         $pk = static::primaryKey()[0];
         if ($this->getIsNewRecord()) {
             $id = null;
-        } elseif ($pk == '_id') {
-            $id = $this->_id;
         } else {
-            $id = $this->getOldAttribute($pk);
+            $id = $this->_id;
         }
         if ($asArray) {
             return [$pk => $id];
@@ -251,21 +304,15 @@ class ActiveRecord extends BaseActiveRecord
 
     /**
      * This method defines the attribute that uniquely identifies a record.
+     * The name of the primary key attribute is `_id`, and can not be changed.
      *
-     * The primaryKey for elasticsearch documents is the `_id` field by default. This field is not part of the
-     * ActiveRecord attributes so you should never add `_id` to the list of [[attributes()|attributes]].
-     *
-     * You may override this method to define the primary key name when you have defined
-     * [path mapping](http://www.elastic.co/guide/en/elasticsearch/reference/current/mapping-id-field.html)
-     * for the `_id` field so that it is part of the `_source` and thus part of the [[attributes()|attributes]].
-     *
-     * Note that elasticsearch only supports _one_ attribute to be the primary key. However to match the signature
+     * Elasticsearch does not support composite primary keys in the traditional sense. However to match the signature
      * of the [[\yii\db\ActiveRecordInterface|ActiveRecordInterface]] this methods returns an array instead of a
      * single string.
      *
      * @return string[] array of primary key attributes. Only the first element of the array will be used.
      */
-    public static function primaryKey()
+    final public static function primaryKey()
     {
         return ['_id'];
     }
@@ -274,18 +321,16 @@ class ActiveRecord extends BaseActiveRecord
      * Returns the list of all attribute names of the model.
      *
      * This method must be overridden by child classes to define available attributes.
+     * IMPORTANT: The primary key (the `_id` attribute) MUST NOT be included in [[attributes()]].
      *
-     * Attributes are names of fields of the corresponding elasticsearch document.
-     * The primaryKey for elasticsearch documents is the `_id` field by default which is not part of the attributes.
-     * You may define [path mapping](http://www.elastic.co/guide/en/elasticsearch/reference/current/mapping-id-field.html)
-     * for the `_id` field so that it is part of the `_source` fields and thus becomes part of the attributes.
+     * Attributes are names of fields of the corresponding Elasticsearch document.
      *
      * @return string[] list of attribute names.
      * @throws \yii\base\InvalidConfigException if not overridden in a child class.
      */
     public function attributes()
     {
-        throw new InvalidConfigException('The attributes() method of elasticsearch ActiveRecord has to be implemented by child classes.');
+        throw new InvalidConfigException('The attributes() method of Elasticsearch ActiveRecord has to be implemented by child classes.');
     }
 
     /**
@@ -310,6 +355,8 @@ class ActiveRecord extends BaseActiveRecord
     }
 
     /**
+     * Returns the name of the type of this record.
+     * IMPORTANT: For Elasticsearch 7 and later, [[type()]] is ignored.
      * @return string the name of the type of this record.
      */
     public static function type()
@@ -333,8 +380,8 @@ class ActiveRecord extends BaseActiveRecord
         if (isset($row['fields'])) {
             // reset fields in case it is scalar value
             $arrayAttributes = $record->arrayAttributes();
-            foreach($row['fields'] as $key => $value) {
-                if (!isset($arrayAttributes[$key]) && count($value) == 1) {
+            foreach ($row['fields'] as $key => $value) {
+                if (!isset($arrayAttributes[$key]) && count($value) === 1) {
                     $row['fields'][$key] = reset($value);
                 }
             }
@@ -343,10 +390,8 @@ class ActiveRecord extends BaseActiveRecord
 
         parent::populateRecord($record, $attributes);
 
-        $pk = static::primaryKey()[0];//TODO should always set ID in case of fields are not returned
-        if ($pk === '_id') {
-            $record->_id = $row['_id'];
-        }
+        $pk = static::primaryKey()[0];
+        $record->_id = $row[$pk];
         $record->_highlight = isset($row['highlight']) ? $row['highlight'] : null;
         $record->_score = isset($row['_score']) ? $row['_score'] : null;
         $record->_version = isset($row['_version']) ? $row['_version'] : null; // TODO version should always be available...
@@ -395,9 +440,7 @@ class ActiveRecord extends BaseActiveRecord
      * Only the [[dirtyAttributes|changed attribute values]] will be inserted into database.
      *
      * If the [[primaryKey|primary key]] is not set (null) during insertion,
-     * it will be populated with a
-     * [randomly generated value](http://www.elastic.co/guide/en/elasticsearch/reference/current/docs-index_.html#_automatic_id_generation)
-     * after insertion.
+     * it will be populated with a randomly generated value after insertion.
      *
      * For example, to insert a customer record:
      *
@@ -408,21 +451,21 @@ class ActiveRecord extends BaseActiveRecord
      * $customer->insert();
      * ~~~
      *
-     * @param boolean $runValidation whether to perform validation before saving the record.
+     * @param bool $runValidation whether to perform validation before saving the record.
      * If the validation fails, the record will not be inserted into the database.
      * @param array $attributes list of attributes that need to be saved. Defaults to null,
      * meaning all attributes will be saved.
-     * @param array $options options given in this parameter are passed to elasticsearch
+     * @param array $options options given in this parameter are passed to Elasticsearch
      * as request URI parameters. These are among others:
      *
      * - `routing` define shard placement of this record.
      * - `parent` by giving the primaryKey of another record this defines a parent-child relation
      *
-     * Please refer to the [elasticsearch documentation](http://www.elastic.co/guide/en/elasticsearch/reference/current/docs-index_.html)
+     * Please refer to the [Elasticsearch documentation](https://www.elastic.co/guide/en/elasticsearch/reference/current/docs-index_.html)
      * for more details on these options.
      *
      * By default the `op_type` is set to `create` if model primary key is present.
-     * @return boolean whether the attributes are valid and the record is inserted successfully.
+     * @return bool whether the attributes are valid and the record is inserted successfully.
      */
     public function insert($runValidation = true, $attributes = null, $options = [ ])
     {
@@ -437,8 +480,7 @@ class ActiveRecord extends BaseActiveRecord
         if ($this->getPrimaryKey() !== null) {
             $options['op_type'] = isset($options['op_type']) ? $options['op_type'] : 'create';
         }
-        Yii::$app->params['es_pro_id'] = $values['m_id'];
-        //unset($values['_id']);
+
         $response = static::getDb()->createCommand()->insert(
             static::index(),
             static::type(),
@@ -446,6 +488,10 @@ class ActiveRecord extends BaseActiveRecord
             $this->getPrimaryKey(),
             $options
         );
+
+        if ($response === false) {
+            return false;
+        }
 
         $pk = static::primaryKey()[0];
         $this->$pk = $response['_id'];
@@ -465,11 +511,11 @@ class ActiveRecord extends BaseActiveRecord
     /**
      * @inheritdoc
      *
-     * @param boolean $runValidation whether to perform validation before saving the record.
+     * @param bool $runValidation whether to perform validation before saving the record.
      * If the validation fails, the record will not be inserted into the database.
      * @param array $attributeNames list of attribute names that need to be saved. Defaults to null,
      * meaning all attributes that are loaded from DB will be saved.
-     * @param array $options options given in this parameter are passed to elasticsearch
+     * @param array $options options given in this parameter are passed to Elasticsearch
      * as request URI parameters. These are among others:
      *
      * - `routing` define shard placement of this record.
@@ -480,19 +526,19 @@ class ActiveRecord extends BaseActiveRecord
      * - `refresh` refresh the relevant primary and replica shards (not the whole index) immediately after the operation occurs, so that the updated document appears in search results immediately.
      * - `detect_noop` this parameter will become part of the request body and will prevent the index from getting updated when nothing has changed.
      *
-     * Please refer to the [elasticsearch documentation](http://www.elastic.co/guide/en/elasticsearch/reference/current/docs-update.html#_parameters_3)
+     * Please refer to the [Elasticsearch documentation](https://www.elastic.co/guide/en/elasticsearch/reference/current/docs-update.html#docs-update-api-query-params)
      * for more details on these options.
      *
      * The following parameters are Yii specific:
      *
      * - `optimistic_locking` set this to `true` to enable optimistic locking, avoid updating when the record has changed since it
      *   has been loaded from the database. Yii will set the `version` parameter to the value stored in [[version]].
-     *   See the [elasticsearch documentation](http://www.elastic.co/guide/en/elasticsearch/guide/current/optimistic-concurrency-control.html) for details.
+     *   See the [Elasticsearch documentation](https://www.elastic.co/guide/en/elasticsearch/guide/current/optimistic-concurrency-control.html) for details.
      *
      *   Make sure the record has been fetched with a [[version]] before. This is only the case
      *   for records fetched via [[get()]] and [[mget()]] by default. For normal queries, the `_version` field has to be fetched explicitly.
      *
-     * @return integer|boolean the number of rows affected, or false if validation fails
+     * @return int|bool the number of rows affected, or false if validation fails
      * or [[beforeSave()]] stops the updating process.
      * @throws StaleObjectException if optimistic locking is enabled and the data being updated is outdated.
      * @throws InvalidParamException if no [[version]] is available and optimistic locking is enabled.
@@ -507,14 +553,14 @@ class ActiveRecord extends BaseActiveRecord
     }
 
     /**
-     * @see update()
      * @param array $attributes attributes to update
-     * @param array $options options given in this parameter are passed to elasticsearch
+     * @param array $options options given in this parameter are passed to Elasticsearch
      * as request URI parameters. See [[update()]] for details.
-     * @return integer|false the number of rows affected, or false if [[beforeSave()]] stops the updating process.
+     * @return int|false the number of rows affected, or false if [[beforeSave()]] stops the updating process.
      * @throws StaleObjectException if optimistic locking is enabled and the data being updated is outdated.
      * @throws InvalidParamException if no [[version]] is available and optimistic locking is enabled.
      * @throws Exception in case update failed.
+     * @see update()
      */
     protected function updateInternal($attributes = null, $options = [])
     {
@@ -529,7 +575,7 @@ class ActiveRecord extends BaseActiveRecord
 
         if (isset($options['optimistic_locking']) && $options['optimistic_locking']) {
             if ($this->_version === null) {
-                throw new InvalidParamException('Unable to use optimistic locking on a record that has no version set. Refer to the docs of ActiveRecord::update() for details.');
+                throw new InvalidArgumentException('Unable to use optimistic locking on a record that has no version set. Refer to the docs of ActiveRecord::update() for details.');
             }
             $options['version'] = $this->_version;
             unset($options['optimistic_locking']);
@@ -543,9 +589,9 @@ class ActiveRecord extends BaseActiveRecord
                 $values,
                 $options
             );
-        } catch(Exception $e) {
+        } catch (Exception $e) {
             // HTTP 409 is the response in case of failed optimistic locking
-            // http://www.elastic.co/guide/en/elasticsearch/guide/current/optimistic-concurrency-control.html
+            // https://www.elastic.co/guide/en/elasticsearch/guide/current/optimistic-concurrency-control.html
             if (isset($e->errorInfo['responseCode']) && $e->errorInfo['responseCode'] == 409) {
                 throw new StaleObjectException('The object being updated is outdated.', $e->errorInfo, $e->getCode(), $e);
             }
@@ -598,7 +644,7 @@ class ActiveRecord extends BaseActiveRecord
     }
 
     /**
-     * Updates all records whos primary keys are given.
+     * Updates all records that match a certain condition.
      * For example, to change the status to be 1 for all customers whose status is 2:
      *
      * ~~~
@@ -608,9 +654,9 @@ class ActiveRecord extends BaseActiveRecord
      * @param array $attributes attribute values (name-value pairs) to be saved into the table
      * @param array $condition the conditions that will be passed to the `where()` method when building the query.
      * Please refer to [[ActiveQuery::where()]] on how to specify this parameter.
-     * @see [[ActiveRecord::primaryKeysByCondition()]]
-     * @return integer the number of rows updated
+     * @return int the number of rows updated
      * @throws Exception on error.
+     * @see [[ActiveRecord::primaryKeysByCondition()]]
      */
     public static function updateAll($attributes, $condition = [])
     {
@@ -656,9 +702,9 @@ class ActiveRecord extends BaseActiveRecord
      * Use negative values if you want to decrement the counters.
      * @param array $condition the conditions that will be passed to the `where()` method when building the query.
      * Please refer to [[ActiveQuery::where()]] on how to specify this parameter.
-     * @see [[ActiveRecord::primaryKeysByCondition()]]
-     * @return integer the number of rows updated
+     * @return int the number of rows updated
      * @throws Exception on error.
+     * @see [[ActiveRecord::primaryKeysByCondition()]]
      */
     public static function updateAllCounters($counters, $condition = [])
     {
@@ -705,7 +751,7 @@ class ActiveRecord extends BaseActiveRecord
     /**
      * @inheritdoc
      *
-     * @param array $options options given in this parameter are passed to elasticsearch
+     * @param array $options options given in this parameter are passed to Elasticsearch
      * as request URI parameters. These are among others:
      *
      * - `routing` define shard placement of this record.
@@ -715,19 +761,19 @@ class ActiveRecord extends BaseActiveRecord
      * - `consistency` the write consistency of the index/delete operation.
      * - `refresh` refresh the relevant primary and replica shards (not the whole index) immediately after the operation occurs, so that the updated document appears in search results immediately.
      *
-     * Please refer to the [elasticsearch documentation](http://www.elastic.co/guide/en/elasticsearch/reference/current/docs-delete.html)
+     * Please refer to the [Elasticsearch documentation](https://www.elastic.co/guide/en/elasticsearch/reference/current/docs-delete.html)
      * for more details on these options.
      *
      * The following parameters are Yii specific:
      *
      * - `optimistic_locking` set this to `true` to enable optimistic locking, avoid updating when the record has changed since it
      *   has been loaded from the database. Yii will set the `version` parameter to the value stored in [[version]].
-     *   See the [elasticsearch documentation](http://www.elastic.co/guide/en/elasticsearch/reference/current/docs-delete.html#delete-versioning) for details.
+     *   See the [Elasticsearch documentation](https://www.elastic.co/guide/en/elasticsearch/reference/current/docs-delete.html#delete-versioning) for details.
      *
      *   Make sure the record has been fetched with a [[version]] before. This is only the case
      *   for records fetched via [[get()]] and [[mget()]] by default. For normal queries, the `_version` field has to be fetched explicitly.
      *
-     * @return integer|boolean the number of rows deleted, or false if the deletion is unsuccessful for some reason.
+     * @return int|bool the number of rows deleted, or false if the deletion is unsuccessful for some reason.
      * Note that it is possible the number of rows deleted is 0, even though the deletion execution is successful.
      * @throws StaleObjectException if optimistic locking is enabled and the data being deleted is outdated.
      * @throws Exception in case delete failed.
@@ -739,7 +785,7 @@ class ActiveRecord extends BaseActiveRecord
         }
         if (isset($options['optimistic_locking']) && $options['optimistic_locking']) {
             if ($this->_version === null) {
-                throw new InvalidParamException('Unable to use optimistic locking on a record that has no version set. Refer to the docs of ActiveRecord::delete() for details.');
+                throw new InvalidArgumentException('Unable to use optimistic locking on a record that has no version set. Refer to the docs of ActiveRecord::delete() for details.');
             }
             $options['version'] = $this->_version;
             unset($options['optimistic_locking']);
@@ -752,9 +798,9 @@ class ActiveRecord extends BaseActiveRecord
                 $this->getOldPrimaryKey(false),
                 $options
             );
-        } catch(Exception $e) {
+        } catch (Exception $e) {
             // HTTP 409 is the response in case of failed optimistic locking
-            // http://www.elastic.co/guide/en/elasticsearch/guide/current/optimistic-concurrency-control.html
+            // https://www.elastic.co/guide/en/elasticsearch/guide/current/optimistic-concurrency-control.html
             if (isset($e->errorInfo['responseCode']) && $e->errorInfo['responseCode'] == 409) {
                 throw new StaleObjectException('The object being deleted is outdated.', $e->errorInfo, $e->getCode(), $e);
             }
@@ -784,9 +830,9 @@ class ActiveRecord extends BaseActiveRecord
      *
      * @param array $condition the conditions that will be passed to the `where()` method when building the query.
      * Please refer to [[ActiveQuery::where()]] on how to specify this parameter.
-     * @see [[ActiveRecord::primaryKeysByCondition()]]
-     * @return integer the number of rows deleted
+     * @return int the number of rows deleted
      * @throws Exception on error.
+     * @see [[ActiveRecord::primaryKeysByCondition()]]
      */
     public static function deleteAll($condition = [])
     {
@@ -809,6 +855,10 @@ class ActiveRecord extends BaseActiveRecord
         foreach ($response['items'] as $item) {
             if (isset($item['delete']['status']) && $item['delete']['status'] == 200) {
                 if (isset($item['delete']['found']) && $item['delete']['found']) {
+                    # ES5 uses "found"
+                    $n++;
+                } elseif (isset($item['delete']['result']) && $item['delete']['result'] == "deleted") {
+                    # ES6 uses "result"
                     $n++;
                 }
             } else {
@@ -825,7 +875,7 @@ class ActiveRecord extends BaseActiveRecord
     /**
      * This method has no effect in Elasticsearch ActiveRecord.
      *
-     * Elasticsearch ActiveRecord uses [native Optimistic locking](http://www.elastic.co/guide/en/elasticsearch/guide/current/optimistic-concurrency-control.html).
+     * Elasticsearch ActiveRecord uses [native Optimistic locking](https://www.elastic.co/guide/en/elasticsearch/guide/current/optimistic-concurrency-control.html).
      * See [[update()]] for more details.
      */
     public function optimisticLock()
@@ -836,10 +886,63 @@ class ActiveRecord extends BaseActiveRecord
     /**
      * Destroys the relationship in current model.
      *
-     * This method is not supported by elasticsearch.
+     * This method is not supported by Elasticsearch.
      */
     public function unlinkAll($name, $delete = false)
     {
-        throw new NotSupportedException('unlinkAll() is not supported by elasticsearch, use unlink() instead.');
+        throw new NotSupportedException('unlinkAll() is not supported by Elasticsearch, use unlink() instead.');
+    }
+
+    public function link($name, $model, $extraColumns = [])
+    {
+        $relation = $this->getRelation($name);
+
+        if ($relation->via === null) {
+            $this->validateViaRelationLink($model, $relation);
+        }
+
+        parent::link($name, $model, $extraColumns);
+    }
+
+    /**
+     * Validates model so that it does not contain array as its keys while linking.
+     *
+     * @param ActiveRecordInterface $model the model to be linked with the current one.
+     * @param ActiveQueryInterface|ActiveQuery the relational query object.
+     */
+    protected function validateViaRelationLink($model, $relation)
+    {
+        $p1 = $model->isPrimaryKey(array_keys($relation->link));
+        $p2 = static::isPrimaryKey(array_values($relation->link));
+
+        $atLeastOneExists = !$this->getIsNewRecord() || !$model->getIsNewRecord();
+
+        $foreign = null;
+        $link = null;
+
+        if ($p1 && $p2 && $atLeastOneExists) {
+
+            if ($this->getIsNewRecord()) {
+                $foreign = $this;
+                $link = array_flip($relation->link);
+            } else {
+                $foreign = $model;
+                $link = $relation->link;
+            }
+        } elseif ($p1) {
+            $foreign = $this;
+            $link = array_flip($relation->link);
+        } elseif ($p2) {
+            $foreign = $model;
+            $link = $relation->link;
+        }
+
+        if ($foreign && $link) {
+            foreach ($link as $fk => $pk) {
+                if (is_array($foreign->{$fk})) {
+                    throw new InvalidCallException('Unable to link models: foreign model cannot be linked if its property is an array.');
+                }
+            }
+        }
     }
 }
